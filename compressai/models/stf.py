@@ -34,7 +34,7 @@ class Adapter(nn.Module):
         self.up_project = nn.Linear(bottleneck_dim, output_dim)
         
         # Weights might not be available in the state dict
-        nn.init.normal_(self.down_project, 0.0, 8 / math.sqrt(bottleneck_dim))
+        nn.init.normal_(self.down_project.weight, 0.0, 8 / math.sqrt(bottleneck_dim))
         nn.init.zeros_(self.up_project.weight)
         nn.init.zeros_(self.up_project.bias)
 

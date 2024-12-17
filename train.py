@@ -48,13 +48,10 @@ class RateDistortionLoss(nn.Module):
             for likelihoods in output["likelihoods"].values()
         )
 
-        wandb.log({
-            "Y log-likelihood": torch.log(output['likelihoods']['y']).sum(),
-            "Z log-likelihood": torch.log(output['likelihoods']['z']).sum(),
-        }, step=epoch)
-
         out["mse_loss"] = self.mse(output["x_hat"], target)
         out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+        out["z_loss"] = torch.log(output["likelihoods"]["z"]).sum()
+        out["y_loss"] = torch.log(output["likelihoods"]["y"]).sum()
 
         return out
 
@@ -111,6 +108,7 @@ def configure_optimizers(net, args):
     optimizer = optim.Adam(
         (params_dict[n] for n in sorted(parameters)),
         lr=args.learning_rate,
+        capturable=True,
     )
     aux_optimizer = optim.Adam(
         (params_dict[n] for n in sorted(aux_parameters)),
@@ -156,11 +154,14 @@ def train_one_epoch(
             )
 
             wandb.log({
-                "Loss": out_criterion['loss'].item(),
+                "Epoch": epoch,
+                "Train / Loss": out_criterion['loss'].item(),
                 "Train / MSE Loss": out_criterion['mse_loss'],
                 "Train / BPP Loss": out_criterion['bpp_loss'],
-                "Aux loss": aux_loss.item(),
-            }, step=epoch + i / n_items, commit=True)
+                "Train / Aux loss": aux_loss.item(),
+                "Train / z loss": out_criterion["z_loss"],
+                "Train / y loss": out_criterion["y_loss"],
+            })
             
 
 
@@ -173,6 +174,9 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
 
+    z_loss = AverageMeter()
+    y_loss = AverageMeter()
+
     with torch.no_grad():
         for d in test_dataloader:
             d = d.to(device)
@@ -184,6 +188,9 @@ def test_epoch(epoch, test_dataloader, model, criterion):
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
 
+            z_loss.update(out_criterion["z_loss"])
+            y_loss.update(out_criterion["y_loss"])
+
     print(
         f"Test epoch {epoch}: Average losses:"
         f"\tLoss: {loss.avg:.3f} |"
@@ -193,11 +200,12 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     )
 
     wandb.log({
+        "Epoch": epoch,
         "Test / Loss": loss.avg,
         "Test / MSE Loss": mse_loss.avg * 255 ** 2 / 3,
         "Test / Bpp Loss": bpp_loss.avg,
         "Test / Aux Loss": aux_loss.avg,
-    }, step=epoch, commit=True)
+    })
     return loss.avg
 
 
@@ -310,7 +318,7 @@ def main(argv):
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
     wb = wandb.init("alice", "main", {
-        "lambda": args.lbda,
+        "lambda": args.lmbda,
     })
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
