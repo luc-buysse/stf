@@ -349,9 +349,9 @@ def main(argv):
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
         has_data_parallel = True
-        print("HERE")
-    else:
-        print("Number of cude available devices: ", torch.cuda.device_count())
+    
+    if args.adapter:
+        net.freeze_except_adapters()
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -380,9 +380,6 @@ def main(argv):
             aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
         if "lr_scheduler" in checkpoint:
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-
-        if args.adapter:
-            net.freeze_except_adapters()
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
