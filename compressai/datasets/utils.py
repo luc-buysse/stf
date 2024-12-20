@@ -57,9 +57,15 @@ class ImageFolder(Dataset):
         Returns:
             img: `PIL.Image.Image` or transformed `PIL.Image.Image`.
         """
-        img = Image.open(self.samples[index]).convert("RGB")
-        if self.transform:
-            return self.transform(img)
+        try:
+            img = Image.open(self.samples[index]).convert("RGB")
+            if self.transform:
+                return self.transform(img)
+        except:
+            print(f"Warning: the image {self.samples[index]} is corrupted")
+            img = Image.open(self.samples[0]).convert("RGB")
+            if self.transform:
+                return self.transform(img)
         return img
 
     def __len__(self):

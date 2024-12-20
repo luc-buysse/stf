@@ -17,6 +17,7 @@ import math
 import random
 import shutil
 import sys
+import os
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,8 @@ from torchvision import transforms
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import models
+
+import torch.distributed as dist
 
 import wandb
 
@@ -181,7 +184,7 @@ def test_epoch(epoch, test_dataloader, model, criterion):
         for d in test_dataloader:
             d = d.to(device)
             out_net = model(d)
-            out_criterion = criterion(out_net, d)
+            out_criterion = criterion(out_net, d, epoch)
 
             aux_loss.update(model.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
@@ -346,9 +349,12 @@ def main(argv):
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
         has_data_parallel = True
+        print("HERE")
+    else:
+        print("Number of cude available devices: ", torch.cuda.device_count())
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.3, patience=4)
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0
