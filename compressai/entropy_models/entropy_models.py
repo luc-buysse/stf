@@ -226,7 +226,7 @@ class EntropyModel(nn.Module):
         strings = []
         for i in range(symbols.size(0)):
             l = self._quantized_cdf.tolist()
-            assert all(0 <= symbol < len(l) for symbol in symbols[i].reshape(-1).int().tolist())
+
             rv = self.entropy_coder.encode_with_indexes(
                 symbols[i].reshape(-1).int().tolist(),
                 indexes[i].reshape(-1).int().tolist(),
@@ -508,8 +508,6 @@ class EntropyBottleneck(EntropyModel):
         return tensor.reshape(-1, *([1] * n)) if n > 0 else tensor.reshape(-1)
 
     def compress(self, x):
-        print("Quantized cdf: ", self._quantized_cdf)
-
         indexes = self._build_indexes(x.size())
         medians = self._get_medians().detach()
         spatial_dims = len(x.size()) - 2

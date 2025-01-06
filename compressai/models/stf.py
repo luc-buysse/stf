@@ -34,7 +34,7 @@ class Adapter(nn.Module):
         self.up_project = nn.Linear(bottleneck_dim, output_dim)
         
         # Weights might not be available in the state dict
-        nn.init.normal_(self.down_project.weight, 0.0, 8 / math.sqrt(bottleneck_dim))
+        nn.init.normal_(self.down_project.weight, 0.0, 1 / math.sqrt(bottleneck_dim))
         nn.init.zeros_(self.up_project.weight)
         nn.init.zeros_(self.up_project.bias)
 
@@ -48,7 +48,7 @@ def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
     return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., adp_ratio=None):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., config=None, alpha=8):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -57,18 +57,18 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
-        self.has_adp = False
-        if adp_ratio != None:
-            self.has_adp = True
-            adp_hidden_dim = int(min(in_features, hidden_features) * adp_ratio)
-            self.adp1 = Adapter(in_features, adp_hidden_dim, hidden_features)
-            self.adp2 = Adapter(hidden_features, adp_hidden_dim, in_features)
+        self.has_adp = config != None
+        if self.has_adp:
+            self.alpha1 = config[0][0]
+            self.alpha2 = config[1][0]
+            self.adp1 = Adapter(in_features, config[0][1], hidden_features)
+            self.adp2 = Adapter(hidden_features, config[1][1], in_features)
 
     def forward(self, x):
-        x = self.fc1(x) + (self.adp1(x) if self.has_adp else 0)
+        x = self.fc1(x) + (self.alpha1 * self.adp1(x) if self.has_adp else 0)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x) + (self.adp2(x) if self.has_adp else 0)
+        x = self.fc2(x) + (self.alpha2 * self.adp2(x) if self.has_adp else 0)
         x = self.drop(x)
         return x
 
@@ -157,7 +157,7 @@ class WindowAttention(nn.Module):
 class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, inverse=False, adp_ratio=None):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, inverse=False, adp_ratio=None, config=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -175,7 +175,7 @@ class SwinTransformerBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, adp_ratio=adp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, config=config)
 
         self.H = None
         self.W = None
@@ -309,7 +309,8 @@ class BasicLayer(nn.Module):
                  downsample=None,
                  use_checkpoint=False,
                  inverse=False,
-                 adp_ratio=None):
+                 adp_ratio=None,
+                 config=None):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
@@ -318,6 +319,8 @@ class BasicLayer(nn.Module):
         self.adp_ratio = adp_ratio
 
         # build blocks
+        cfg_indexes = list(range(1, depth+1))
+        if not inverse: cfg_indexes.reverse()
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(
                 dim=dim,
@@ -332,7 +335,8 @@ class BasicLayer(nn.Module):
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
                 inverse=inverse,
-                adp_ratio=adp_ratio)
+                adp_ratio=adp_ratio,
+                config=None if config == None or f't{cfg_indexes[i]}' not in config else config[f't{cfg_indexes[i]}'])
             for i in range(depth)])
 
         # patch merging layer
@@ -438,7 +442,8 @@ class SymmetricalTransFormer(CompressionModel):
                  patch_norm=True,
                  frozen_stages=-1,
                  use_checkpoint=False,
-                 adp_ratio=0.05):
+                 adp_ratio=0.05,
+                 config=None):
         super().__init__()
 
         self.pretrain_img_size = pretrain_img_size
@@ -460,6 +465,7 @@ class SymmetricalTransFormer(CompressionModel):
 
         # build layers
         self.layers = nn.ModuleList()
+        enc_config = None if config == None or "encoder" not in config else config['encoder']
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=int(embed_dim * 2 ** i_layer),
@@ -476,12 +482,15 @@ class SymmetricalTransFormer(CompressionModel):
                 downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
                 inverse=False,
-                adp_ratio=adp_ratio if i_layer == (self.num_layers-1) else None)
+                adp_ratio=adp_ratio if i_layer == (self.num_layers-1) else None,
+                config=None if enc_config == None or f'b{i_layer+1}' not in enc_config else enc_config[f'b{i_layer+1}'])
             self.layers.append(layer)
 
         depths = depths[::-1]
         num_heads = num_heads[::-1]
         self.syn_layers = nn.ModuleList()
+        dec_config = None if config == None or "decoder" not in config else config['decoder']
+        dec_config = enc_config if "symmetrical" in dec_config and dec_config['symmetrical'] else dec_config
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=int(embed_dim * 2 ** (3-i_layer)),
@@ -498,7 +507,8 @@ class SymmetricalTransFormer(CompressionModel):
                 downsample=PatchSplit if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
                 inverse=True,
-                adp_ratio=adp_ratio if i_layer == 0 else None)
+                adp_ratio=adp_ratio if i_layer == 0 else None,
+                config=None if dec_config == None or f'b{self.num_layers-i_layer}' not in dec_config else dec_config[f'b{self.num_layers-i_layer}'])
             self.syn_layers.append(layer)
 
         self.end_conv = nn.Sequential(nn.Conv2d(embed_dim, embed_dim * patch_size ** 2, kernel_size=5, stride=1, padding=2),
@@ -604,26 +614,6 @@ class SymmetricalTransFormer(CompressionModel):
                 m.eval()
                 for param in m.parameters():
                     param.requires_grad = False
-    
-    def freeze_except_adapters(self):
-        total_size = 0
-
-        for param in self.parameters():
-            param.require_grad = False
-            total_size += param.numel()
-
-        print("Total number of parameters: ", total_size)
-        
-        total_size = 0
-        
-        for name, module in self.named_modules():
-            if isinstance(module, Adapter):
-                for param in module.parameters():
-                    total_size += param.numel()
-                    param.require_grad = True
-        
-        print("Total number of adapter parameters: ", total_size)
-
 
     def init_weights(self):
         for m in self.modules():
@@ -725,9 +715,9 @@ class SymmetricalTransFormer(CompressionModel):
         super().load_state_dict(state_dict, strict)
 
     @classmethod
-    def from_state_dict(cls, state_dict):
+    def from_state_dict(cls, state_dict, config):
         """Return a new model instance from `state_dict`."""
-        net = cls()
+        net = cls(config=config)
         net.load_state_dict(state_dict)
         return net
 

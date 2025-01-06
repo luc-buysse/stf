@@ -18,19 +18,23 @@ import random
 import shutil
 import sys
 import os
+import yaml
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import transforms
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import models
+from compressai.models.stf import Adapter
 
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP 
 
+from torch.utils.tensorboard import SummaryWriter
 import wandb
 
 class RateDistortionLoss(nn.Module):
@@ -75,7 +79,7 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-class CustomDataParallel(nn.DataParallel):
+class CustomDataParallel(DDP):
     """Custom DataParallel to access the module methods."""
 
     def __getattr__(self, key):
@@ -89,32 +93,25 @@ def configure_optimizers(net, args):
     """Separate parameters for the main optimizer and the auxiliary optimizer.
     Return two optimizers"""
 
-    parameters = {
-        n
-        for n, p in net.named_parameters()
-        if not n.endswith(".quantiles") and p.requires_grad
-    }
-    aux_parameters = {
-        n
-        for n, p in net.named_parameters()
-        if n.endswith(".quantiles") and p.requires_grad
-    }
+    parameters = []
+    aux_parameters = [p for n, p in net.named_parameters() if n.endswith(".quantiles")]
 
-    # Make sure we don't have an intersection of parameters
-    params_dict = dict(net.named_parameters())
-    inter_params = parameters & aux_parameters
-    union_params = parameters | aux_parameters
+    for m in net.modules():
+        if isinstance(m, Adapter):
+            for p in m.parameters():
+                parameters.append(p)
+    
+    print("Params: ", len(parameters))
+    print("Aux params: ", len(aux_parameters))
 
-    assert len(inter_params) == 0
-    assert len(union_params) - len(params_dict.keys()) == 0
 
     optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(parameters)),
+        parameters,
         lr=args.learning_rate,
         capturable=True,
     )
     aux_optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(aux_parameters)),
+        aux_parameters,
         lr=args.aux_learning_rate,
     )
     return optimizer, aux_optimizer
@@ -145,7 +142,7 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i % 100 == 0:
+        if i % 100 == 0 and rank == 0:
             print(
                 f"Train epoch {epoch}: ["
                 f"{i*len(d)}/{len(train_dataloader.dataset)}"
@@ -156,7 +153,7 @@ def train_one_epoch(
                 f"\tAux loss: {aux_loss.item():.2f}"
             )
 
-            wandb.log({
+            log({
                 "Epoch": epoch,
                 "Train / Loss": out_criterion['loss'].item(),
                 "Train / MSE Loss": out_criterion['mse_loss'],
@@ -202,7 +199,7 @@ def test_epoch(epoch, test_dataloader, model, criterion):
         f"\tAux loss: {aux_loss.avg:.2f}\n"
     )
 
-    wandb.log({
+    log({
         "Epoch": epoch,
         "Test / Loss": loss.avg,
         "Test / MSE Loss": mse_loss.avg * 255 ** 2 / 3,
@@ -221,6 +218,12 @@ def save_checkpoint(state, is_best, filename):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
     parser.add_argument(
+        "-c",
+        "--config",
+        default=None,
+        help="Training configuration file path"
+    )
+    parser.add_argument(
         "-m",
         "--model",
         default="stf",
@@ -228,7 +231,7 @@ def parse_args(argv):
         help="Model architecture (default: %(default)s)",
     )
     parser.add_argument(
-        "-d", "--dataset", type=str, required=True, help="Training dataset"
+        "-d", "--dataset", type=str, help="Training dataset"
     )
     parser.add_argument(
         "-e",
@@ -248,7 +251,7 @@ def parse_args(argv):
         "-n",
         "--num-workers",
         type=int,
-        default=30,
+        default=10,
         help="Dataloaders threads (default: %(default)s)",
     )
     parser.add_argument(
@@ -296,15 +299,88 @@ def parse_args(argv):
         type=float,
         help="gradient clipping max norm (default: %(default)s",
     )
+    parser.add_argument(
+        "--eval",
+        default=None,
+        help="Additional evaluation set"
+    )
+    parser.add_argument(
+        "--monitor",
+        choices=['tensorboard', 'wandb', 'none'],
+        default="tensorboard",
+        help="Monitor: wandb / tensorboard / none"
+    )
+    parser.add_argument(
+        "--name",
+        help="Name of the run"
+    )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--adapter", action="store_true", default=False)
     args = parser.parse_args(argv)
     return args
 
+def init_slurm():
+    global rank, world_size
+    if "WORLD_SIZE" in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        dist.init_process_group(backend="nccl", init_method="env://",
+            world_size=world_size, rank=rank)
+
+def load_config(args):
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    args.model = "stf"
+    args.dataset = config['training']['dataset']
+    args.save_path = config['training']['save']
+    args.checkpoint = config['training']['original']
+    args.eval = config['training']['eval']
+    args.epochs = config['training']['epochs']
+    args.learning_rate = config['training']['lr']
+    args.lmbda = config['training']['lambda']
+    args.cuda = True
+    args.monitor = config['monitor']['type']
+    args.name = config['monitor']['name']
+
+    return None if 'model' not in config else config['model']
+
+def init_monitor(args):
+    global monitor_type
+    monitor_type = args.monitor
+
+    if args.monitor == "tensorboard":
+        global writer
+        writer = SummaryWriter(f'alice/{args.name}')
+    
+    if args.monitor == "wandb":
+        wandb.init(f'alice/{args.name}')
+
+def log(content):
+    if monitor_type == "wandb":
+        wandb.log(content)
+    
+    elif monitor_type == "tensorboard":
+        for k, v in content.items():
+            writer.add_scalar(k, v)
 
 def main(argv):
+    print("HAHAHIHI")
+
+    init_slurm()
+
     args = parse_args(argv)
-    print(args)
+
+    if args.config != None:
+        model_config = load_config(args)
+    
+    if rank == 0:
+        print("HERE")
+        print(args)
+    
+    init_monitor(args)
+    
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
@@ -320,38 +396,41 @@ def main(argv):
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
-    wb = wandb.init("alice", "main", {
-        "lambda": args.lmbda,
-    })
-
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+
+    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        shuffle=True,
+        sampler=sampler,
         pin_memory=(device == "cuda"),
     )
 
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=args.test_batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=(device == "cuda"),
-    )
+    print("Rank : ", rank)
 
-    net = models[args.model]()
+    if rank == 0:
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=args.test_batch_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+            pin_memory=(device == "cuda"),
+        )
+        print("Model config: ", model_config)
+
+    if args.config != None:
+        net = models[args.model](config=model_config)
+    else:
+        net = models[args.model]()
+
     net = net.to(device)
 
     has_data_parallel = False
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
         has_data_parallel = True
-    
-    if args.adapter:
-        net.freeze_except_adapters()
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -359,7 +438,8 @@ def main(argv):
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
-        print("Loading", args.checkpoint)
+        if rank == 0:
+            print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
 
         if "epoch" in checkpoint:
@@ -383,7 +463,8 @@ def main(argv):
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        if rank == 0:
+            print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
         train_one_epoch(
             net,
             criterion,
@@ -393,26 +474,37 @@ def main(argv):
             epoch,
             args.clip_max_norm,
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
+
+        if rank == 0:
+            loss = test_epoch(epoch, test_dataloader, net, criterion)
+        
+        torch.distributed.broadcast(loss, src=0)
+
         lr_scheduler.step(loss)
 
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
+        if rank == 0:
+            is_best = loss < best_loss
+            best_loss = min(loss, best_loss)
 
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
-                is_best,
-                args.save_path,
-            )
+            if args.save:
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "state_dict": net.state_dict(),
+                        "loss": loss,
+                        "optimizer": optimizer.state_dict(),
+                        "aux_optimizer": aux_optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "config": model_config,
+                    },
+                    is_best,
+                    args.save_path,
+                )
+    
+    dist.destroy_process_group()
 
+    if monitor_type == "tensorboard":
+        writer.close()
 
 if __name__ == "__main__":
     main(sys.argv[1:])

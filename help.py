@@ -66,6 +66,7 @@ def parse_load(args):
 
 def load_bottleneck(path):
     state_dict = torch.load(path)["state_dict"]
+    state_dict = {k[7:]: v for k, v in state_dict.items() if k[:7] == "module."}
     filtered = {}
 
     for k in state_dict:

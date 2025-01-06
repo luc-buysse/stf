@@ -148,8 +148,11 @@ def inference_entropy_estimation(model, x):
 
 
 def load_checkpoint(arch: str, checkpoint_path: str) -> nn.Module:
-    state_dict = load_state_dict(torch.load(checkpoint_path)['state_dict'])
-    return models[arch].from_state_dict(state_dict).eval()
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = load_state_dict(checkpoint['state_dict'])
+    config = checkpoint['config']
+
+    return models[arch].from_state_dict(state_dict, config).eval()
 
 
 def eval_model(model, filepaths, entropy_estimation=False, half=False, recon_path='reconstruction'):
