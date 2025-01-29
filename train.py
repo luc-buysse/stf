@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torchvision import transforms
 
 from compressai.datasets import ImageFolder
@@ -101,9 +101,10 @@ def configure_optimizers(net, args):
             for p in m.parameters():
                 parameters.append(p)
     
-    print("Params: ", len(parameters))
-    print("Aux params: ", len(aux_parameters))
-
+    if args.unfreeze_encoder:
+        for layer in net.layers:
+            for p in layer.parameters():
+                parameters.append(p)
 
     optimizer = optim.Adam(
         parameters,
@@ -315,15 +316,19 @@ def parse_args(argv):
         help="Name of the run"
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
+    parser.add_argument("--limit", type=int, default=-1, help="A limit on the number of images to use for training (-1 for unlimited)")
+    parser.add_argument("--unfreeze-encoder", action="store_true", help="Unfreeze all encoder parameters (no adapters)")
     args = parser.parse_args(argv)
     return args
 
 def init_slurm():
+    print('Trying to initialize SLURM with CUDA_VISIBLE_DEVICES set to : ', os.environ['CUDA_VISIBLE_DEVICES'])
+
     global rank, world_size
     if "WORLD_SIZE" in os.environ and int(os.environ['WORLD_SIZE']) > 1:
         world_size = int(os.environ['WORLD_SIZE'])
         rank = int(os.environ['SLURM_PROCID'])
-        world_size = int(os.environ["WORLD_SIZE"])
+        #os.environ['CUDA_VISIBLE_DEVICES'] = str(os.environ['SLURM_LOCALID'])
 
         dist.init_process_group(backend="nccl", init_method="env://",
             world_size=world_size, rank=rank)
@@ -344,6 +349,14 @@ def load_config(args):
     args.monitor = config['monitor']['type']
     args.name = config['monitor']['name']
 
+    if 'limit' in config['training']:
+        args.limit = config['training']['limit']
+    else:
+        args.limit = -1
+
+    if "model" in config and 'encoder' in config['model'] and 'unfreeze' in config['model']['encoder']:
+        args.unfreeze_encoder = config['model']['encoder']['unfreeze']
+
     return None if 'model' not in config else config['model']
 
 def init_monitor(args):
@@ -351,22 +364,31 @@ def init_monitor(args):
     monitor_type = args.monitor
 
     if args.monitor == "tensorboard":
-        global writer
+        global writer, writer_step
         writer = SummaryWriter(f'alice/{args.name}')
+        writer_step = 0
     
     if args.monitor == "wandb":
         wandb.init(f'alice/{args.name}')
 
 def log(content):
+    global writer_step
     if monitor_type == "wandb":
         wandb.log(content)
     
     elif monitor_type == "tensorboard":
         for k, v in content.items():
-            writer.add_scalar(k, v)
+            writer.add_scalar(k, v, writer_step)
+            writer_step += 1
+
 
 def main(argv):
-    print("HAHAHIHI")
+    print(
+        "Rank=", os.getenv("SLURM_PROCID", "?"), 
+        "LocalRank=", os.getenv("SLURM_LOCALID", "?"), 
+        "CUDA_VISIBLE_DEVICES=", os.getenv("CUDA_VISIBLE_DEVICES", "None"),
+        flush=True
+    )
 
     init_slurm()
 
@@ -376,7 +398,6 @@ def main(argv):
         model_config = load_config(args)
     
     if rank == 0:
-        print("HERE")
         print(args)
     
     init_monitor(args)
@@ -394,6 +415,11 @@ def main(argv):
     )
 
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
+
+    if args.limit != -1 and args.limit < len(train_dataset):
+        subset_indices = range(0, args.limit)
+        train_dataset = Subset(train_dataset, subset_indices)
+
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -408,8 +434,6 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    print("Rank : ", rank)
-
     if rank == 0:
         test_dataloader = DataLoader(
             test_dataset,
@@ -418,7 +442,6 @@ def main(argv):
             shuffle=False,
             pin_memory=(device == "cuda"),
         )
-        print("Model config: ", model_config)
 
     if args.config != None:
         net = models[args.model](config=model_config)
@@ -462,6 +485,7 @@ def main(argv):
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
     best_loss = float("inf")
+    loss = 0
     for epoch in range(last_epoch, args.epochs):
         if rank == 0:
             print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
@@ -477,10 +501,7 @@ def main(argv):
 
         if rank == 0:
             loss = test_epoch(epoch, test_dataloader, net, criterion)
-        
-        torch.distributed.broadcast(loss, src=0)
-
-        lr_scheduler.step(loss)
+            lr_scheduler.step(loss)
 
         if rank == 0:
             is_best = loss < best_loss
