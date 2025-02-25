@@ -14,23 +14,14 @@ Pytorch implementation of the paper "ALICE: Adapt your Learnable Image Compressi
 Install [CompressAI](https://github.com/InterDigitalInc/CompressAI) and the packages required for development.
 
 ```bash
-
 conda  create  -n  compress  python=3.7
-
 conda  activate  compress
-
 pip  install  compressai
-
 pip  install  pybind11
-
 git  clone  https://github.com/luc-buysse/stf.git  stf
-
 cd  stf
-
 pip  install  -e  .
-
 pip  install  -e  '.[dev]'
-
 ```
 
   
