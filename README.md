@@ -24,8 +24,6 @@ pip  install  -e  .
 pip  install  -e  '.[dev]'
 ```
 
-  
-
 ## Training
 
 To train adapters for the model, it is necessary to have a SLURM environment available.
