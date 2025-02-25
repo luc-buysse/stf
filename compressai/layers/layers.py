@@ -20,9 +20,12 @@ from .win_attention import WinBasedAttention
 
 __all__ = [
     "conv3x3",
+    "conv3x3_adp",
     "subpel_conv3x3",
+    "subpel_conv3x3_adp",
     "conv1x1",
     "Win_noShift_Attention",
+    "Conv3x3Adapter",
 ]
 
 
@@ -30,11 +33,42 @@ def conv3x3(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
     """3x3 convolution with padding."""
     return nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
 
+class Conv3x3Adapter():
+    def __init__(self, in_ch, out_ch, adp_ch,):
+        
+
+        self.down_project = conv3x3(in_ch, adp_ch, stride)
+        self.up_project = conv3x3(adp_ch, out_ch, stride)
+    
+    def forward(self, x):
+        x = self.down_project(x)
+        x = self.up_project(x)
+        return x
+
+class Conv3x3WithAdp():
+    def __init__(self, in_ch, out_ch, alpha, adp_ch, stride=1):
+        self.conv = conv3x3(in_ch, out_ch, stride)
+        self.adp = Conv3x3Adapter(in_ch, out_ch, adp_ch, stride)
+        self.alpha = alpha
+        
+    def forward(self, x):
+        return self.conv(x) + self.alpha * self.adp(x)
+
+
+def conv3x3_adp(in_ch: int, out_ch: int, alpha: float, adp_ch: int, stride: int = 1) -> nn.Module:
+    return Conv3x3WithAdp(in_ch, out_ch, alpha, adp_ch, stride)
+
 
 def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
     """3x3 sub-pixel convolution for up-sampling."""
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch * r ** 2, kernel_size=3, padding=1), nn.PixelShuffle(r)
+    )
+
+def subpel_conv3x3_adp(in_ch: int, out_ch: int, alpha: int, adp_ch: int, r: int = 1) -> nn.Sequential:
+    """3x3 sub-pixel convolution for up-sampling."""
+    return nn.Sequential(
+        conv3x3_adp(in_ch, out_ch * r ** 2, alpha, adp_ch), nn.PixelShuffle(r)
     )
 
 

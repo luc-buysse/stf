@@ -19,6 +19,7 @@ import shutil
 import sys
 import os
 import yaml
+import re
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,7 @@ from torchvision import transforms
 from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from compressai.models.stf import Adapter
+from compressai.layers import Conv3x3Adapter
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP 
@@ -97,7 +99,7 @@ def configure_optimizers(net, args):
     aux_parameters = [p for n, p in net.named_parameters() if n.endswith(".quantiles")]
 
     for m in net.modules():
-        if isinstance(m, Adapter):
+        if isinstance(m, Adapter) or isinstance(m, Conv3x3Adapter):
             for p in m.parameters():
                 parameters.append(p)
     
@@ -315,6 +317,11 @@ def parse_args(argv):
         "--name",
         help="Name of the run"
     )
+    parser.add_argument(
+        "--scheduler",
+        default='CosineAnnealing',
+        help="Type of scheduler: CosineAnnealing (default) / ReduceLROnPlateau(factor, patience)"
+    )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
     parser.add_argument("--limit", type=int, default=-1, help="A limit on the number of images to use for training (-1 for unlimited)")
     parser.add_argument("--unfreeze-encoder", action="store_true", help="Unfreeze all encoder parameters (no adapters)")
@@ -353,6 +360,11 @@ def load_config(args):
         args.limit = config['training']['limit']
     else:
         args.limit = -1
+    
+    if 'scheduler' in config['training']:
+        args.scheduler = config['training']['scheduler']
+    else:
+        args.scheduler = "CosineAnnealing"
 
     if "model" in config and 'encoder' in config['model'] and 'unfreeze' in config['model']['encoder']:
         args.unfreeze_encoder = config['model']['encoder']['unfreeze']
@@ -456,7 +468,17 @@ def main(argv):
         has_data_parallel = True
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    if args.scheduler == "CosineAnnealing":
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    else:
+        rer = re.search(r"ReduceLROnPlateau\(\s*(\d+.?\d*)\s*,\s*([\d]+)\s*\)", args.scheduler)
+        if rer == None:
+            raise ArgumentTypeError("Invalid scheduler argument")
+
+        print("Using parameters: ", float(rer[1]), int(rer[2]))
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', float(rer[1]), int(rer[2]))
+
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0

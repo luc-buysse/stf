@@ -150,7 +150,8 @@ def inference_entropy_estimation(model, x):
 def load_checkpoint(arch: str, checkpoint_path: str) -> nn.Module:
     checkpoint = torch.load(checkpoint_path)
     state_dict = load_state_dict(checkpoint['state_dict'])
-    config = checkpoint['config']
+
+    config = checkpoint.get('config', None)
 
     return models[arch].from_state_dict(state_dict, config).eval()
 

@@ -85,8 +85,8 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
-class WindowAttention(nn.Module):
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+class WindowAttention(nn.Module): 
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., config=None):
 
         super().__init__()
         self.dim = dim
@@ -117,6 +117,17 @@ class WindowAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.has_adp = config != None
+        if self.has_adp:
+            if len(config) != 2 or len(config[0]) != 2 or len(config[1]) != 2:
+                raise TypeError("Invalid attention configuration")
+
+            self.adp_q = Adapter(dim, config[0][1], dim)
+            self.adp_v = Adapter(dim, config[1][1], dim)
+
+            self.alpha_q = config[0][0]
+            self.alpha_v = config[1][0]
+
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
@@ -129,6 +140,13 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous() # qkv, B, nH, N, C_
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        
+        if self.has_adp:
+            add_q = self.alpha_q * self.adp_q(x).reshape(B_, N, 1, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous().squeeze()
+            add_v = self.alpha_v * self.adp_v(x).reshape(B_, N, 1, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous().squeeze()
+
+            q += add_q
+            v += add_v
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1)) # B_, nH, N, N
@@ -157,25 +175,24 @@ class WindowAttention(nn.Module):
 class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, inverse=False, adp_ratio=None, config=None):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, inverse=False, mlp_config=None, att_config=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        self.adp_ratio = adp_ratio
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, config=att_config)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, config=config)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, config=mlp_config)
 
         self.H = None
         self.W = None
@@ -309,14 +326,12 @@ class BasicLayer(nn.Module):
                  downsample=None,
                  use_checkpoint=False,
                  inverse=False,
-                 adp_ratio=None,
                  config=None):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-        self.adp_ratio = adp_ratio
 
         # build blocks
         cfg_indexes = list(range(1, depth+1))
@@ -335,8 +350,8 @@ class BasicLayer(nn.Module):
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
                 inverse=inverse,
-                adp_ratio=adp_ratio,
-                config=None if config == None or f't{cfg_indexes[i]}' not in config else config[f't{cfg_indexes[i]}'])
+                mlp_config=None if config == None or f't{cfg_indexes[i]}' not in config else config[f't{cfg_indexes[i]}'],
+                att_config=None if config == None or f'a{cfg_indexes[i]}' not in config else config[f'a{cfg_indexes[i]}'])
             for i in range(depth)])
 
         # patch merging layer
@@ -442,7 +457,6 @@ class SymmetricalTransFormer(CompressionModel):
                  patch_norm=True,
                  frozen_stages=-1,
                  use_checkpoint=False,
-                 adp_ratio=0.05,
                  config=None):
         super().__init__()
 
@@ -482,15 +496,17 @@ class SymmetricalTransFormer(CompressionModel):
                 downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
                 inverse=False,
-                adp_ratio=adp_ratio if i_layer == (self.num_layers-1) else None,
                 config=None if enc_config == None or f'b{i_layer+1}' not in enc_config else enc_config[f'b{i_layer+1}'])
             self.layers.append(layer)
 
         depths = depths[::-1]
         num_heads = num_heads[::-1]
         self.syn_layers = nn.ModuleList()
-        dec_config = None if config == None or "decoder" not in config else config['decoder']
-        dec_config = enc_config if "symmetrical" in dec_config and dec_config['symmetrical'] else dec_config
+        if config != None:
+            dec_config = None if "decoder" not in config else config['decoder']
+            dec_config = enc_config if "symmetrical" in dec_config and dec_config['symmetrical'] else dec_config
+        else: 
+            dec_config = None
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=int(embed_dim * 2 ** (3-i_layer)),
@@ -507,7 +523,6 @@ class SymmetricalTransFormer(CompressionModel):
                 downsample=PatchSplit if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
                 inverse=True,
-                adp_ratio=adp_ratio if i_layer == 0 else None,
                 config=None if dec_config == None or f'b{self.num_layers-i_layer}' not in dec_config else dec_config[f'b{self.num_layers-i_layer}'])
             self.syn_layers.append(layer)
 
@@ -521,40 +536,85 @@ class SymmetricalTransFormer(CompressionModel):
         self.g_a = None
         self.g_s = None
 
-        self.h_a = nn.Sequential(
-            conv3x3(384, 384),
-            nn.GELU(),
-            conv3x3(384, 336),
-            nn.GELU(),
-            conv3x3(336, 288, stride=2),
-            nn.GELU(),
-            conv3x3(288, 240),
-            nn.GELU(),
-            conv3x3(240, 192, stride=2),
-        )
-
-        self.h_mean_s = nn.Sequential(
-            conv3x3(192, 240),
-            nn.GELU(),
-            subpel_conv3x3(240, 288, 2),
-            nn.GELU(),
-            conv3x3(288, 336),
-            nn.GELU(),
-            subpel_conv3x3(336, 384, 2),
-            nn.GELU(),
-            conv3x3(384, 384),
-        )
-        self.h_scale_s = nn.Sequential(
-            conv3x3(192, 240),
-            nn.GELU(),
-            subpel_conv3x3(240, 288, 2),
-            nn.GELU(),
-            conv3x3(288, 336),
-            nn.GELU(),
-            subpel_conv3x3(336, 384, 2),
-            nn.GELU(),
-            conv3x3(384, 384),
-        )
+        if config is not None and "entropy" in config and "h_a" in config:
+            (a1, h1), (a2, h2), (a3, h3), (a4, h4), (a5, h5) = config['h_a']
+            self.h_a = nn.Sequential(
+                conv3x3_adp(384, 384, a1, h1),
+                nn.GELU(),
+                conv3x3_adp(384, 336, a2, h2),
+                nn.GELU(),
+                conv3x3_adp(336, 288, a3, h3, stride=2),
+                nn.GELU(),
+                conv3x3_adp(288, 240, a4, h4),
+                nn.GELU(),
+                conv3x3_adp(240, 192, a5, h5, stride=2),
+            )
+        else:
+            self.h_a = nn.Sequential(
+                conv3x3(384, 384),
+                nn.GELU(),
+                conv3x3(384, 336),
+                nn.GELU(),
+                conv3x3(336, 288, stride=2),
+                nn.GELU(),
+                conv3x3(288, 240),
+                nn.GELU(),
+                conv3x3(240, 192, stride=2),
+            )
+        
+        if config is not None and "entropy" in config and "h_mean_s" in config:
+            (a1, h1), (a2, h2), (a3, h3), (a4, h4), (a5, h5) = config['h_mean_s']
+            self.h_mean_s = nn.Sequential(
+                conv3x3_adp(192, 240, a1, h1),
+                nn.GELU(),
+                subpel_conv3x3_adp(240, 288, a2, h2, 2),
+                nn.GELU(),
+                conv3x3_adp(288, 336, a3, h3),
+                nn.GELU(),
+                subpel_conv3x3_adp(336, 384, a4, h4, 2),
+                nn.GELU(),
+                conv3x3_adp(384, 384, a5, h5),
+            )
+        else:
+            self.h_mean_s = nn.Sequential(
+                conv3x3(192, 240),
+                nn.GELU(),
+                subpel_conv3x3(240, 288, 2),
+                nn.GELU(),
+                conv3x3(288, 336),
+                nn.GELU(),
+                subpel_conv3x3(336, 384, 2),
+                nn.GELU(),
+                conv3x3(384, 384),
+            )
+        
+        if config is not None and "entropy" in config and "h_scale_s" in config:
+            (a1, h1), (a2, h2), (a3, h3), (a4, h4), (a5, h5) = config['h_scale_s']
+            self.h_scale_s = nn.Sequential(
+                conv3x3_adp(192, 240, a1, h1),
+                nn.GELU(),
+                subpel_conv3x3_adp(240, 288, a2, h2, 2),
+                nn.GELU(),
+                conv3x3_adp(288, 336, a3, h3),
+                nn.GELU(),
+                subpel_conv3x3_adp(336, 384, a4, h4, 2),
+                nn.GELU(),
+                conv3x3_adp(384, 384, a5, h5),
+            )
+        else:
+            self.h_scale_s = nn.Sequential(
+                conv3x3(192, 240),
+                nn.GELU(),
+                subpel_conv3x3(240, 288, 2),
+                nn.GELU(),
+                conv3x3(288, 336),
+                nn.GELU(),
+                subpel_conv3x3(336, 384, 2),
+                nn.GELU(),
+                conv3x3(384, 384),
+            )
+        
+        
         self.cc_mean_transforms = nn.ModuleList(
             nn.Sequential(
                 conv(384 + 32 * min(i, 6), 224, stride=1, kernel_size=3),
