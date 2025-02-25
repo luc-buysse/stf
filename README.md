@@ -1,125 +1,108 @@
-# The Devil Is in the Details: Window-based Attention for Image Compression
-Pytorch implementation of the paper "The Devil Is in the Details: Window-based Attention for Image Compression". CVPR2022.
-This repository is based on [CompressAI](https://github.com/InterDigitalInc/CompressAI). We kept scripts for training and evaluation, and removed other components. The major changes are provided in `compressai/models`. For the official code release, see the [CompressAI](https://github.com/InterDigitalInc/CompressAI).
+# ALICE: Adapt your Learnable Image Compression modEl for variable bitrates
 
-## About
-This repo defines the CNN-based models and Transformer-based models for learned image compression in "The Devil Is in the Details: Window-based Attention for Image Compression".
+  
 
+Pytorch implementation of the paper "ALICE: Adapt your Learnable Image Compression modEl for variable bitrates". This repository is based on [Devil is in the details](https://github.com/InterDigitalInc/CompressAI). The major changes are provided in `compressai/models/stf.py`.
 
-![cnn_arch](https://github.com/Googolxx/STF/blob/main/assets/cnn_arch.png)
->  The architecture of CNN-based model.
-
-![stf_arch](https://github.com/Googolxx/STF/blob/main/assets/stf_arch.png)
->  The architecture of Transformer-based model (STF).
-
+  
+  
 
 ## Installation
 
+  
+
 Install [CompressAI](https://github.com/InterDigitalInc/CompressAI) and the packages required for development.
+
 ```bash
-conda create -n compress python=3.7
-conda activate compress
-pip install compressai
-pip install pybind11
-git clone https://github.com/Googolxx/STF stf
-cd stf
-pip install -e .
-pip install -e '.[dev]'
+
+conda  create  -n  compress  python=3.7
+
+conda  activate  compress
+
+pip  install  compressai
+
+pip  install  pybind11
+
+git  clone  https://github.com/luc-buysse/stf.git  stf
+
+cd  stf
+
+pip  install  -e  .
+
+pip  install  -e  '.[dev]'
+
 ```
 
-> **Note**: wheels are available for Linux and MacOS.
+  
 
-## Usage
+## Training
 
-### Training
-An examplary training script with a rate-distortion loss is provided in
-`train.py`. 
+To train adapters for the model, it is necessary to have a SLURM environment available.
 
-Training a CNN-based model:
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python train.py -d /path/to/image/dataset/ -e 1000 --batch-size 16 --save --save_path /path/to/save/ -m cnn --cuda --lambda 0.0035
-e.g., CUDA_VISIBLE_DEVICES=0,1 python train.py -d openimages -e 1000 --batch-size 16 --save --save_path ckpt/cnn_0035.pth.tar -m cnn --cuda --lambda 0.0035
+The folder stf/configs contain several example configurations of trainings. A valid configuration should respect the yaml formatting and contain the following blocks:
+```yaml
+model: # A description of the model
+	encoder / decoder:
+		unfreeze: true # To unfreeze all the parameters of the model
+		b1 / b2 / b3 / b4: # For the 4 sequences of transformers
+			t1 / t2 / t3 / t4 / t5 / t6: [[alpha: int, rank: int], [alpha: int, rank: int]] # Defines the rank and alpha values of the LoRAs within the MLP layers of the transformers
+			a1 / a2 / a3 / a4 / a5 / a6: [[alpha: int, rank: int], [alpha: int, rank: int]]
+		symmetrical: true # Only for the decoder, automatically copies the configuration of the encoder
+
+training:
+	epochs: int # Number of epochs
+	lr: float # Learning rate
+	lambda: float # Lambda value for the RD tradeoff
+	scheduler: string # By default CosineAnnealing, can also be ReduceLROnPlateau(reduction_factor: float, patience: int)
+	original: string # Original model
+	dataset: string # Location of the fiftyone dataset folder
+	save: string # Name of the file in which the model should be saved
+
+monitor:
+	type: tensorboard / wandb
+	name: string # Identifier of the training
 ```
-Training a Transformer-based model(STF):
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python train.py -d /path/to/image/dataset/ -e 1000 --batch-size 16 --save --save_path /path/to/save/ -m stf --cuda --lambda 0.0035
-```
 
+To start a training from a configuration file, navigate to the *stf* folder and execute the command `python3 run.py <config_name>` the name of the configuration should not include the .yml extension.
+  
+  
 
 ### Evaluation
 
+  
+
 To evaluate a trained model on your own dataset, the evaluation script is:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m compressai.utils.eval_model -d /path/to/image/folder/ -r /path/to/reconstruction/folder/ -a stf -p /path/to/checkpoint/ --cuda
-```
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m compressai.utils.eval_model -d /path/to/image/folder/ -r /path/to/reconstruction/folder/ -a cnn -p /path/to/checkpoint/ --cuda
-```
+  
 
+```bash
+
+CUDA_VISIBLE_DEVICES=0  python  -m  compressai.utils.eval_model  -d  /path/to/image/folder/  -r  /path/to/reconstruction/folder/  -a  stf  -p  /path/to/checkpoint/  --cuda
+
+```
+  
+  
 
 ### Dataset
+
 The script for downloading [OpenImages](https://github.com/openimages) is provided in `downloader_openimages.py`. Please install [fiftyone](https://github.com/voxel51/fiftyone) first.
 
-## Results
-
-### Visualization
-
-![visualization01](https://github.com/Googolxx/STF/blob/main/assets/detail_01.png)
->  Visualization of the reconstructed image kodim01.png.
-
-![visualization07](https://github.com/Googolxx/STF/blob/main/assets/detail_07.png)
->  Visualization of the reconstructed image kodim07.png.
->
-### RD curves
-
-![kodak_rd](https://github.com/Googolxx/STF/blob/main/assets/kodak_rd.png)
->  RD curves on [Kodak](http://r0k.us/graphics/kodak/).
-
-![clic_rd](https://github.com/Googolxx/STF/blob/main/assets/clic_rd.png)
->  RD curves on [CLIC Professional Validation dataset](https://www.compression.cc/).
-
-### Codec Efficiency on [Kodak](http://r0k.us/graphics/kodak/)
-| Method | Enc(s) | Dec(s) | PSNR | bpp |
-| ------------ | ------ | ------ | ------ | ------ |
-| CNN | 0.12 | 0.12 | 35.91 | 0.650 |
-| STF | 0.15 | 0.15 | 35.82 | 0.651 |
-
-### Pretrained Models
-Pretrained models (optimized for MSE) trained from scratch using randomly chose 300k images from the OpenImages dataset.
-
-| Method | Lambda | Link                                                                                              |
-| ---- |--------|---------------------------------------------------------------------------------------------------|
-| CNN | 0.0018 | [cnn_0018](https://drive.google.com/file/d/1RPdtyxTtfosuDe1-xtl5JzvnCU2vYnHD/view?usp=sharing)    |
-| CNN | 0.0035 | [cnn_0035](https://drive.google.com/file/d/1L7xvei3Wj4BeSQ3lDBL-pyjEy13RKsjn/view?usp=sharing)    |
-| CNN | 0.0067 | [cnn_0067](https://drive.google.com/file/d/1DDCFFWBUa5cYOgJ9D9HPcwoOigzoJK31/view?usp=sharing)    |
-| CNN | 0.025  | [cnn_025](https://drive.google.com/file/d/1LrAWPlBE6WJUfjiDPGFO8ANSaP5BFEQI/view?usp=sharing)     |
-| STF | 0.0018 | [stf_0018](https://drive.google.com/file/d/15ujpSjif628iwVEay3mAWN-Vyqls3r23/view?usp=sharing) |
-| STF | 0.0035 | [stf_0035](https://drive.google.com/file/d/1OFzZoEaofNgsimBuOPHtgOJiGsR_RS-M/view?usp=sharing)    |
-| STF | 0.0067 | [stf_0067](https://drive.google.com/file/d/1SjhqcKyP3SqVm4yhJQslJ6HgY1E8FcBL/view?usp=share_link) |
-| STF | 0.013  | [stf_013](https://drive.google.com/file/d/1mupv4vcs8wpNdXCPclXghliikJyYjgj-/view?usp=share_link)  |
-| STF | 0.025  | [stf_025](https://drive.google.com/file/d/1rsYgEYuqSYBIA4rfvAjXtVSrjXOzkJlB/view?usp=sharing)     |
-| STF | 0.0483 | [stf_0483](https://drive.google.com/file/d/1cH5cR-0VdsQqCchyN3DO62Sx0WGjv1h8/view?usp=share_link) |
-
-Other pretrained models will be released successively.
-## Citation
-```
-@inproceedings{zou2022the,
-  title={The Devil Is in the Details: Window-based Attention for Image Compression},
-  author={Zou, Renjie and Song, Chunfeng and Zhang, Zhaoxiang},
-  booktitle={CVPR},
-  year={2022}
-}
-```
+  
 
 ## Related links
- * CompressAI: https://github.com/InterDigitalInc/CompressAI
- * Swin-Transformer: https://github.com/microsoft/Swin-Transformer
- * Tensorflow compression library by Ballé et al.: https://github.com/tensorflow/compression
- * Range Asymmetric Numeral System code from Fabian 'ryg' Giesen: https://github.com/rygorous/ryg_rans
- * Kodak Images Dataset: http://r0k.us/graphics/kodak/
- * Open Images Dataset: https://github.com/openimages
- * fiftyone: https://github.com/voxel51/fiftyone
- * CLIC: https://www.compression.cc/
 
+* Devil is in the details: https://github.com/Googolxx/STF.git
 
+* Swin-Transformer: https://github.com/microsoft/Swin-Transformer
+
+* Tensorflow compression library by Ballé et al.: https://github.com/tensorflow/compression
+
+* Range Asymmetric Numeral System code from Fabian 'ryg' Giesen: https://github.com/rygorous/ryg_rans
+
+* Kodak Images Dataset: http://r0k.us/graphics/kodak/
+
+* Open Images Dataset: https://github.com/openimages
+
+* fiftyone: https://github.com/voxel51/fiftyone
+
+* CLIC: https://www.compression.cc/
