@@ -2,7 +2,7 @@
 
   
 
-Pytorch implementation of the paper "ALICE: Adapt your Learnable Image Compression modEl for variable bitrates". This repository is based on [Devil is in the details](https://github.com/InterDigitalInc/CompressAI). The major changes are provided in `compressai/models/stf.py`.
+Pytorch implementation of the paper "ALICE: Adapt your Learnable Image Compression modEl for variable bitrates". This repository is based on [Devil is in the details](https://github.com/InterDigitalInc/CompressAI). The major changes are provided in `compressai/models/stf.py` and `train.py`.
 
   
   
